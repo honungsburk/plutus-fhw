@@ -1,0 +1,6 @@
+cradle:
+  cabal:
+    - path: "./src"
+      component: "plutus-fhw"
+    - path: "./app/hello.hs"
+      component: "exe:hello"
