@@ -10,7 +10,8 @@ License-files:       LICENSE
 
 library
   hs-source-dirs:      src
-  exposed-modules:     InfiniteSale
+  exposed-modules:     NFTPolicy
+                       InfiniteSale
   other-modules:       
   build-depends:       aeson
                      , base ^>=4.14.1.0
