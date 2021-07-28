@@ -35,7 +35,7 @@ import Prelude (IO, Semigroup (..), String, show)
 -- https://plutus.readthedocs.io/en/latest/plutus/tutorials/basic-minting-policies.html
 
 {-# INLINEABLE mkPolicy #-}
-mkPolicy :: TxOutRef -> TokenName -> ScriptContext -> ScriptContext -> Bool
+mkPolicy :: TxOutRef -> TokenName -> () -> ScriptContext -> Bool
 mkPolicy oref tn _ ctx =
   traceIfFalse "UTxO not consumed" hasUTxO
     && traceIfFalse "wrong amount minted" checkMintedAmount
@@ -70,10 +70,13 @@ mint tn = do
   case Map.keys utxos of
     [] -> Contract.logError @String "no utxo found"
     oref : _ -> do
+      Contract.logInfo @String $ "Creating Constraints"
       let val = Value.singleton (curSymbol oref tn) tn 1
           lookups = Constraints.mintingPolicy (policy oref tn) <> Constraints.unspentOutputs utxos
           tx = Constraints.mustMintValue val <> Constraints.mustSpendPubKeyOutput oref
+      Contract.logInfo @String $ "Submitting transaction"
       ledgerTx <- submitTxConstraintsWith @Void lookups tx
+      Contract.logInfo @String $ "Awaiting confirmation"
       void $ awaitTxConfirmed $ txId ledgerTx
       Contract.logInfo @String $ printf "forged %s" (show val)
 
