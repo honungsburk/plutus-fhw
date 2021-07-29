@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -14,9 +15,11 @@
 module InfiniteSale where
 
 import Control.Monad hiding (fmap)
+import Data.Aeson (FromJSON, ToJSON)
 import qualified Data.Map as Map
 import Data.Text (Text)
 import Data.Void (Void)
+import GHC.Generics (Generic)
 import Ledger hiding (singleton)
 import Ledger.Constraints as Constraints
 import qualified Ledger.Typed.Scripts as Scripts
@@ -31,35 +34,157 @@ import PlutusTx.Prelude hiding (Semigroup (..), unless)
 import Text.Printf (printf)
 import Wallet.Emulator.Wallet
 import Prelude (IO, Semigroup (..), String, show)
+import qualified Prelude
 
--- https://plutus.readthedocs.io/en/latest/plutus/tutorials/basic-minting-policies.html
+--------------------------------------------------------------------------------
+-- Infinite Sale
+--------------------------------------------------------------------------------
+
+data InfinitySaleParam = InfinitySaleParam
+  { -- | The hash of the NFT minting script to use
+    infMintingPolicy :: !CurrencySymbol,
+    -- | The operator/owner control of the smart contract
+    infOperator :: !PubKeyHash,
+    -- | The NFT used to control the minting policy
+    -- infFee :: !Integer,
+    infNFT :: !AssetClass
+  }
+  deriving (Prelude.Show, Generic, FromJSON, ToJSON, Prelude.Eq, Prelude.Ord)
+
+PlutusTx.makeLift ''InfinitySaleParam
+
+{-# INLINEABLE infinitySaleTokenName #-}
+infinitySaleTokenName :: TokenName
+infinitySaleTokenName = TokenName "INFINITY SALE"
+
+{-# INLINEABLE infinityAsset #-}
+infinityAsset :: InfinitySaleParam -> AssetClass
+infinityAsset = infNFT
+
+newtype InfinitySaleDatum = InfinitySaleDatum {numberOfSales :: Integer}
+
+{-# INLINEABLE infinityValue #-}
+infinityValue :: TxOut -> (DatumHash -> Maybe Datum) -> Maybe InfinitySaleDatum
+infinityValue o f = do
+  dh <- txOutDatum o
+  Datum d <- f dh
+  PlutusTx.fromData d
+
+data InfinitySaleRedeemer
+  = -- | Allows anyone to buy a freshly minted art piece
+    Buy
+  | -- | Called by the creator to handover the NFT and set the inital state
+    Init
+  | -- | Called by the creator to collect any fees
+    CollectFees
+  deriving (Prelude.Show, Prelude.Eq)
+
+data InfinitySale
+
+instance Scripts.ValidatorTypes InfinitySale where
+  type DatumType InfinitySale = InfinitySaleDatum
+  type RedeemerType InfinitySale = InfinitySaleRedeemer
+
+{-# INLINEABLE mkInfinitySaleValidator #-}
+mkInfinitySaleValidator :: InfinitySaleParam -> InfinitySaleDatum -> InfinitySaleRedeemer -> ScriptContext -> Bool
+mkInfinitySaleValidator infSale state action ctx =
+  --   traceIfFalse "token missing from input" inputHasToken
+  --     && traceIfFalse "token missing from output" outputHasToken
+  case action of
+    Init ->
+      traceIfFalse "Only the owner can init the script" (txSignedBy info $ infOperator infSale)
+        && traceIfFalse "invalid output datum" validOutputDatum
+    CollectFees ->
+      traceIfFalse "Only the owner can collect fees" (txSignedBy info $ infOperator infSale)
+  where
+    --       Buy ->
+    --         traceIfFalse "oracle value changed" (outputDatum == Just x)
+    --           && traceIfFalse "fees not paid" feesPaid
+
+    info :: TxInfo
+    info = scriptContextTxInfo ctx
+
+    -- Check that the NFT exists at the transaction
+    hasToken :: TxOut -> Bool
+    hasToken txOut = assetClassValueOf (txOutValue txOut) (infinityAsset infSale) == 1
+
+    ownInput :: TxOut
+    ownInput = case findOwnInput ctx of
+      Nothing -> traceError "NFT input missing"
+      Just i -> txInInfoResolved i
+
+    inputHasToken :: Bool
+    inputHasToken = hasToken ownInput
+
+    ownOutput :: TxOut
+    ownOutput = case getContinuingOutputs ctx of
+      [o] -> o
+      _ -> traceError "expected exactly one NFT output"
+
+    outputHasToken :: Bool
+    outputHasToken = hasToken ownOutput
+
+    outputDatum :: Maybe InfinitySaleDatum
+    outputDatum = infinityValue ownOutput (`findDatum` info)
+
+    validOutputDatum :: Bool
+    validOutputDatum = isJust outputDatum
+
+--     feesPaid :: Bool
+--     feesPaid =
+--       let inVal = txOutValue ownInput
+--           outVal = txOutValue ownOutput
+--        in outVal `geq` (inVal <> Ada.lovelaceValueOf (oFee oracle))
+
+infinityValidator :: InfinitySaleParam -> Scripts.TypedValidator InfinitySale
+infinityValidator p =
+  Scripts.mkTypedValidator @InfinitySale
+    ($$(PlutusTx.compile [||mkInfinitySaleValidator||]) `PlutusTx.applyCode` PlutusTx.liftCode p)
+    $$(PlutusTx.compile [||wrap||])
+  where
+    wrap = Scripts.wrapValidator @InfinitySaleDatum @InfinitySaleRedeemer
+
+validator :: InfinitySaleParam -> Validator
+validator = Scripts.validatorScript . infinityValidator
+
+valHash :: InfinitySaleParam -> Ledger.ValidatorHash
+valHash = Scripts.validatorHash . infinityValidator
+
+scrAddress :: InfinitySaleParam -> Ledger.Address
+scrAddress = scriptAddress . validator
+
+--------------------------------------------------------------------------------
+-- Minting from NFT Policy
+--------------------------------------------------------------------------------
 
 {-# INLINEABLE mkPolicy #-}
-mkPolicy :: TxOutRef -> TokenName -> () -> ScriptContext -> Bool
-mkPolicy oref tn _ ctx =
-  traceIfFalse "UTxO not consumed" hasUTxO
-    && traceIfFalse "wrong amount minted" checkMintedAmount
+mkPolicy ::
+  -- | The NFT representing the generative art script
+  AssetClass ->
+  () ->
+  ScriptContext ->
+  Bool
+mkPolicy ac _ ctx =
+  traceIfFalse "NFT did not exist in output" hasNFT
   where
     info :: TxInfo
     info = scriptContextTxInfo ctx
 
-    hasUTxO :: Bool
-    hasUTxO = any (\i -> txInInfoOutRef i == oref) $ txInfoInputs info
+    hasNFT :: Bool
+    hasNFT = any ((==) 1 . (flip assetClassValueOf ac . txOutValue . txInInfoResolved)) $ txInfoInputs info
 
-    checkMintedAmount :: Bool
-    checkMintedAmount = case flattenValue (txInfoForge info) of
-      [(cs, tn', amt)] -> cs == ownCurrencySymbol ctx && tn' == tn && amt == 1
-      _ -> False
-
-policy :: TxOutRef -> TokenName -> Scripts.MintingPolicy
-policy oref tn =
+policy :: AssetClass -> Scripts.MintingPolicy
+policy ac =
   mkMintingPolicyScript $
-    $$(PlutusTx.compile [||\oref' tn' -> Scripts.wrapMintingPolicy $ mkPolicy oref' tn'||])
-      `PlutusTx.applyCode` PlutusTx.liftCode oref
-      `PlutusTx.applyCode` PlutusTx.liftCode tn
+    $$(PlutusTx.compile [||Scripts.wrapMintingPolicy . mkPolicy||])
+      `PlutusTx.applyCode` PlutusTx.liftCode ac
 
-curSymbol :: TxOutRef -> TokenName -> CurrencySymbol
-curSymbol oref tn = scriptCurrencySymbol $ policy oref tn
+curSymbol :: AssetClass -> CurrencySymbol
+curSymbol = scriptCurrencySymbol . policy
+
+--------------------------------------------------------------------------------
+-- Off chain code
+--------------------------------------------------------------------------------
 
 type NFTSchema = Endpoint "mint" TokenName
 
@@ -91,7 +216,7 @@ mkKnownCurrencies []
 
 test :: Prelude.IO ()
 test = runEmulatorTraceIO $ do
-  let tn = "ABC"
+  let tn = "INFINITY"
   h1 <- activateContractWallet (Wallet 1) endpoints
   h2 <- activateContractWallet (Wallet 2) endpoints
   callEndpoint @"mint" h1 tn
